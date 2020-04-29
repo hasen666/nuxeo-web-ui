@@ -30,39 +30,44 @@ void setGitHubBuildStatus(String context, String message, String state) {
   ])
 }
 
-// Replaces environment variables present in the given yaml file and then runs skaffold build on it.
-void skaffoldBuild(String yaml = 'skaffold.yaml') {
-  sh """
-    envsubst < ${yaml} > ${yaml}~gen
-    skaffold build -f ${yaml}~gen
-  """
-}
-
-void dockerPublish(String image) {
-  String src = "${DOCKER_REGISTRY}/${ORG}/${image}:${VERSION}"
-  String target = "${PUBLIC_DOCKER_REGISTRY}/${ORG}/${image}:${VERSION}"
-  echo "Pushing ${target}"
-  sh """
-    docker pull $src
-    docker tag $src $target
-    docker push $target
-  """
-}
-
 def WEBUI_VERSION
 
 pipeline {
   agent {
     label "jenkins-maven-nodejs-nuxeo"
   }
+  options {
+    disableConcurrentBuilds()
+  }
   environment {
     ORG = 'nuxeo'
     APP_NAME = 'nuxeo-web-ui'
     CONNECT_PREPROD_URL = 'https://nos-preprod-connect.nuxeocloud.com/nuxeo'
+    PREVIEW_NAMESPACE = "${APP_NAME}-preview-${BRANCH_NAME.toLowerCase()}"
+    NUXEO_IMAGE_NAME = "docker.packages.nuxeo.com/nuxeo/nuxeo"
+    NUXEO_IMAGE_VERSION = "11.x"
+    NAMESPACE = 'webui'
     // NXBT-2885: need "Pipeline Utility Steps"
     // WEBUI_VERSION = readJSON(file: 'package.json').version
   }
   stages {
+    stage('Compute Web UI Version')
+    {
+      steps {
+        container('mavennodejs') {
+          script {
+            WEBUI_VERSION =  sh(script: 'npx -c \'echo "$npm_package_version"\'', returnStdout: true).trim()
+            if (BRANCH_NAME != 'master') {
+              WEBUI_VERSION = WEBUI_VERSION.replace("-SNAPSHOT", "-${BRANCH_NAME}-SNAPSHOT")
+              sh """
+                npm version ${WEBUI_VERSION}
+                mvn -Pdistrib versions:set -DnewVersion=${WEBUI_VERSION} -DgenerateBackupPoms=false
+              """
+            }
+          }
+        }
+      }
+    }
     stage('Install dependencies and run lint') {
       steps {
         setGitHubBuildStatus('webui/install', 'Install dependencies and run lint', 'PENDING')
@@ -213,18 +218,9 @@ pipeline {
       }
     }
     stage('Publish Nuxeo Packages') {
-      when {
-       branch 'master'
-      }
       steps {
         setGitHubBuildStatus('webui/publish/packages', 'Upload Nuxeo Packages', 'PENDING')
         container('mavennodejs') {
-          script {
-            WEBUI_VERSION =  sh(script: 'npx -c \'echo "$npm_package_version"\'', returnStdout: true).trim()
-            if (BRANCH_NAME != 'master') {
-              WEBUI_VERSION += "-${BRANCH_NAME}";
-            }
-          }
           echo """
           -------------------------------------------------
           Upload Nuxeo Packages to ${CONNECT_PREPROD_URL}
@@ -275,78 +271,43 @@ pipeline {
         }
       }
     }
-    stage('Build and deploy Docker images') {
-      steps {
-        setGitHubBuildStatus('webui/docker', 'Build Docker images', 'PENDING')
-        container('mavennodejs') {
-          withEnv(["VERSION=${WEBUI_VERSION}"]) {
-            echo """
-            ------------------------------
-            Build and deploy Docker images
-            ------------------------------
-            Image tag: ${VERSION}
-            """
-            dir('server') {
-              skaffoldBuild()
-            }
-            skaffoldBuild()
-          }
-        }
-      }
-      post {
-        success {
-          setGitHubBuildStatus('webui/docker', 'Build Docker images', 'SUCCESS')
-        }
-        failure {
-          setGitHubBuildStatus('webui/docker', 'Build Docker images', 'FAILURE')
-        }
-      }
-    }
-    stage('Deploy Preview') {
+    stage('Deploy Web UI Preview') {
       when {
         branch 'PR-*'
       }
       steps {
         container('mavennodejs') {
           withEnv(["PREVIEW_VERSION=$WEBUI_VERSION"]) {
-            echo """
-            -----------------
-            Deploying preview 
-            -----------------
-            """
-            dir('charts/preview') {
-              sh "make preview" // does some env subst before "jx step helm build"
-              sh "jx preview"
+            script {
+              def nuxeoIntanceCli = sh(script: 'jx step credential -s instance-clid -k CLID', returnStdout: true).trim()
+              boolean nsExists = sh(returnStatus: true, script: "kubectl get namespace ${PREVIEW_NAMESPACE}") == 0
+              if (nsExists) {
+                // Previous preview deployment needs to be scaled to 0 to be replaced correctly
+                sh "kubectl -n ${PREVIEW_NAMESPACE} scale deployment preview --replicas=0"
+              }
+              echo """
+              -----------------
+              Deploying preview
+              -----------------
+              """
+              dir('charts/preview') {
+                // does some env subst before "jx step helm build"
+                sh """
+                  export NUXEO_CLID=${nuxeoIntanceCli}
+                  mv values.yaml values.yaml.tosubst
+                  envsubst < values.yaml.tosubst > values.yaml
+                  make preview
+                  jx preview --namespace ${PREVIEW_NAMESPACE} --name ${PREVIEW_NAMESPACE} --verbose --preview-health-timeout 15m
+                """
+              }
+              // We need to expose the nuxeo url by hand
+              url = sh(returnStdout: true, script: "jx get urls -n ${PREVIEW_NAMESPACE} | grep -oP https://.* | tr -d '\\n'")
+              echo """
+                ----------------------------------------
+                Preview available at: ${url}
+                --------------------------------------Ò--"""
             }
           }
-        }
-      }
-    }
-    stage('Publish Docker Images') {
-      when {
-        branch 'master'
-      }
-      steps {
-        setGitHubBuildStatus('webui/publish', 'Publish Docker images', 'PENDING')
-        container('mavennodejs') {
-          withEnv(["VERSION=${WEBUI_VERSION}"]) {
-            echo """
-            ---------------------
-            Publish Docker images
-            ---------------------
-            """
-            dockerPublish("nuxeo-web-ui/server")
-            dockerPublish("nuxeo-web-ui")
-            dockerPublish("nuxeo-web-ui/dev")
-          }
-        }
-      }
-      post {
-        success {
-          setGitHubBuildStatus('webui/publish', 'Publish Docker images', 'SUCCESS')
-        }
-        failure {
-          setGitHubBuildStatus('webui/publish', 'Publish Docker images', 'FAILURE')
         }
       }
     }
